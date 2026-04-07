@@ -18,6 +18,7 @@ use crate::dispatch::rpc::{
 use crate::dispatch::server::RequestHandler;
 use crate::envelope::task_envelope::Priority;
 use crate::governor::ResourceGovernor;
+use crate::store::StateStore;
 use crate::supervisor::kernel::KernelSupervisor;
 use crate::supervisor::process::ProcessId;
 
@@ -71,6 +72,7 @@ pub struct KernelRequestHandler {
     supervisor: Arc<KernelSupervisor>,
     governor: Arc<ResourceGovernor>,
     task_registry: Arc<TaskRegistry>,
+    state_store: Arc<std::sync::Mutex<Box<dyn StateStore>>>,
     trigger_seq: Arc<AtomicU64>,
 }
 
@@ -79,11 +81,13 @@ impl KernelRequestHandler {
         supervisor: Arc<KernelSupervisor>,
         governor: Arc<ResourceGovernor>,
         task_registry: Arc<TaskRegistry>,
+        state_store: Box<dyn StateStore>,
     ) -> Self {
         Self {
             supervisor,
             governor,
             task_registry,
+            state_store: Arc::new(std::sync::Mutex::new(state_store)),
             trigger_seq: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -300,10 +304,45 @@ impl KernelRequestHandler {
                     drift_score,
                     "meta cycle completed"
                 );
-                // TODO: Persist results to state store
+
+                // Persist drift score and policy state for UI read path
+                let mut store = self.state_store.lock().map_err(|e| {
+                    (ERROR_INTERNAL, format!("state store lock poisoned: {e}"))
+                })?;
+
+                // Write drift score — UI drift gauge reads this
+                store
+                    .put(
+                        "sie/identity/last_drift",
+                        drift_score.to_string().into_bytes(),
+                    )
+                    .map_err(|e| (ERROR_INTERNAL, format!("state store write failed: {e}")))?;
+
+                // Write cycle ID as latest completed cycle
+                store
+                    .put(
+                        "sie/meta/last_cycle",
+                        cycle_id.as_bytes().to_vec(),
+                    )
+                    .map_err(|e| (ERROR_INTERNAL, format!("state store write failed: {e}")))?;
+
+                // If policy changed, update the policy head pointer
+                if *policy_changed {
+                    store
+                        .put(
+                            "sie/policy/head",
+                            cycle_id.as_bytes().to_vec(),
+                        )
+                        .map_err(|e| (ERROR_INTERNAL, format!("state store write failed: {e}")))?;
+
+                    tracing::info!(cycle_id, "policy head updated");
+                }
+
                 Ok(serde_json::json!({
                     "status": "persisted",
                     "cycle_id": cycle_id,
+                    "drift_score": drift_score,
+                    "policy_updated": policy_changed,
                 }))
             }
             TriggerKind::TaskCancel { task_id, reason } => {
@@ -383,6 +422,7 @@ impl RequestHandler for KernelRequestHandler {
 mod tests {
     use super::*;
     use crate::governor::GovernorConfig;
+    use crate::store::SqliteStateStore;
     use crate::supervisor::process::RestartPolicy;
 
     async fn make_handler() -> KernelRequestHandler {
@@ -424,8 +464,9 @@ mod tests {
 
         let governor = Arc::new(ResourceGovernor::new(GovernorConfig::default()));
         let registry = Arc::new(TaskRegistry::new());
+        let store = Box::new(SqliteStateStore::open(":memory:").unwrap());
 
-        KernelRequestHandler::new(supervisor, governor, registry)
+        KernelRequestHandler::new(supervisor, governor, registry, store)
     }
 
     #[tokio::test]
@@ -556,7 +597,8 @@ mod tests {
 
         let governor = Arc::new(ResourceGovernor::new(GovernorConfig::default()));
         let registry = Arc::new(TaskRegistry::new());
-        let handler = KernelRequestHandler::new(supervisor, governor, registry);
+        let store = Box::new(SqliteStateStore::open(":memory:").unwrap());
+        let handler = KernelRequestHandler::new(supervisor, governor, registry, store);
 
         let trigger = LoopTrigger::new(
             1,
@@ -585,6 +627,73 @@ mod tests {
         });
         let result = handler.handle(RpcMethod::TaskCancel, Some(params)).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_meta_cycle_complete_persists_to_store() {
+        let handler = make_handler().await;
+
+        let trigger = LoopTrigger::new(
+            1,
+            ProcessId::Loop0Meta,
+            ProcessId::Kernel,
+            TriggerKind::MetaCycleComplete {
+                cycle_id: "cycle-42".into(),
+                policy_changed: true,
+                drift_score: 0.15,
+            },
+        );
+
+        let params = serde_json::to_value(trigger).unwrap();
+        let result = handler
+            .handle(RpcMethod::LoopTrigger, Some(params))
+            .await;
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val["status"], "persisted");
+        assert_eq!(val["policy_updated"], true);
+
+        // Verify state store writes
+        let store = handler.state_store.lock().unwrap();
+        let drift = store.get("sie/identity/last_drift").unwrap().unwrap();
+        assert_eq!(String::from_utf8(drift).unwrap(), "0.15");
+
+        let head = store.get("sie/policy/head").unwrap().unwrap();
+        assert_eq!(String::from_utf8(head).unwrap(), "cycle-42");
+
+        let last_cycle = store.get("sie/meta/last_cycle").unwrap().unwrap();
+        assert_eq!(String::from_utf8(last_cycle).unwrap(), "cycle-42");
+    }
+
+    #[tokio::test]
+    async fn test_meta_cycle_complete_no_policy_change() {
+        let handler = make_handler().await;
+
+        let trigger = LoopTrigger::new(
+            2,
+            ProcessId::Loop0Meta,
+            ProcessId::Kernel,
+            TriggerKind::MetaCycleComplete {
+                cycle_id: "cycle-43".into(),
+                policy_changed: false,
+                drift_score: 0.05,
+            },
+        );
+
+        let params = serde_json::to_value(trigger).unwrap();
+        let result = handler
+            .handle(RpcMethod::LoopTrigger, Some(params))
+            .await;
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val["policy_updated"], false);
+
+        // drift_score and last_cycle should be written, but NOT policy/head
+        let store = handler.state_store.lock().unwrap();
+        let drift = store.get("sie/identity/last_drift").unwrap().unwrap();
+        assert_eq!(String::from_utf8(drift).unwrap(), "0.05");
+
+        assert!(store.get("sie/policy/head").unwrap().is_none());
     }
 
     #[tokio::test]

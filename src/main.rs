@@ -124,7 +124,7 @@ async fn run_daemon(
     // ── State store ────────────────────────────────────────────────
     let state_path = resolve_state_dir(&state_dir);
     let db_path = state_path.join("aros.db");
-    let _store = SqliteStateStore::open(
+    let store = SqliteStateStore::open(
         db_path
             .to_str()
             .ok_or("invalid state directory path (non-UTF8)")?,
@@ -191,6 +191,7 @@ async fn run_daemon(
         supervisor.clone(),
         governor.clone(),
         task_registry.clone(),
+        Box::new(store),
     );
     let rpc_server = Arc::new(RpcServer::new(sockets_dir.join("kernel.sock")));
     let rpc_server_ref = rpc_server.clone();
