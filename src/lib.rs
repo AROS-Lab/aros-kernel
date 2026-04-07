@@ -7,3 +7,4 @@ pub mod envelope;
 pub mod supervisor;
 pub mod governor;
 pub mod dispatch;
+pub mod adapter;
