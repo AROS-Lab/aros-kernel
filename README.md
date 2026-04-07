@@ -1,74 +1,104 @@
 # AROS Kernel
 
-Hardware-aware agent runtime engine for the AROS ecosystem. Manages execution of AI agents (Claude CLI, shell) on resource-constrained systems with memory pressure detection, admission control, and parallel DAG execution.
+The core runtime kernel for AROS (Agent Runtime OS). Manages agent lifecycle, task orchestration, resource governance, model adapter routing, and inter-loop communication via a supervised process tree.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│                  AROS Kernel                     │
-│                                                  │
-│  ┌──────────┐  ┌───────────┐  ┌──────────────┐ │
-│  │ Hardware  │  │ Scheduler │  │     DAG      │ │
-│  │ Monitor   │→│ Admission │→│   Executor    │ │
-│  │           │  │ Control   │  │              │ │
-│  └──────────┘  └───────────┘  └──────────────┘ │
-│       ↓              ↓              ↓            │
-│  ┌──────────────────────────────────────────┐   │
-│  │            Agent Lifecycle                │   │
-│  │  ┌──────────┐  ┌─────────────────────┐   │   │
-│  │  │  Shell   │  │   Claude CLI Agent  │   │   │
-│  │  │  Agent   │  │  (subprocess mgmt)  │   │   │
-│  │  └──────────┘  └─────────────────────┘   │   │
-│  └──────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────┘
+                    ┌─────────────────────────────────────────────┐
+                    │              AROS KERNEL                     │
+                    │                                              │
+  ┌──────────┐     │  ┌────────────────────────────────────────┐  │
+  │  Loop 0  │◄────┤  │         Supervisor Daemon               │  │
+  │  (Meta)  │     │  │  init -> kernel -> loops -> adapters    │  │
+  └──────────┘     │  └──────────────┬─────────────────────────┘  │
+                    │                 │                             │
+  ┌──────────┐     │  ┌──────────────▼─────────────────────────┐  │
+  │  Loop 2  │◄────┤  │       JSON-RPC Dispatch (UDS)           │  │
+  │ (Harness)│     │  │  kernel.sock | loop*.sock | adapter*.sock│  │
+  └──────────┘     │  └──────────────┬─────────────────────────┘  │
+                    │                 │                             │
+  ┌──────────┐     │  ┌──────┬───────┼───────┬──────┬──────────┐  │
+  │  Loop 1  │◄────┤  │State │Resource│  DAG  │Model │ Hardware │  │
+  │(Agentic) │     │  │Store │Governor│Engine │Adapt.│ Monitor  │  │
+  └──────────┘     │  └──────┴───────┴───────┴──────┴──────────┘  │
+                    └─────────────────────────────────────────────┘
 ```
 
 ## Modules
 
-### Hardware (`src/hardware/`)
+### Supervisor (`src/supervisor/`)
+Two-level supervision tree with process lifecycle management.
 
-| Component | Description |
-|-----------|-------------|
-| **SystemResources** | CPU count, total/available RAM, load averages (2s cache) |
-| **MemoryPressureLevel** | Normal / Warn / Critical detection via macOS `sysctl` |
-| **HardwareSnapshot** | Timestamped system state, serializable to JSON |
+- `ProcessId` — Init, Kernel, Loop0–2, ModelAdapter, EmbeddingAdapter
+- `ProcessState` — Starting, Running, Stopping, Stopped, Failed, Restarting
+- `RestartPolicy` — exponential backoff with configurable max restarts
+- `KernelSupervisor` — health aggregation (Healthy/Degraded/Recovering)
+- `KernelRequestHandler` — JSON-RPC router for inter-loop trigger dispatch
 
-macOS-specific: reads `kern.memorystatus_level` and `vm.compressor_bytes_used` for accurate pressure detection. Falls back to RAM ratio on other platforms.
+### Task Envelope (`src/envelope/`)
+Versioned task schema with security and resource constraints.
 
-### Scheduler (`src/scheduler/`)
+- `SecurityZone` — Green (any provider), Yellow (approved only), Red (local only)
+- `Priority` — P0Critical (always admitted), P1Normal (standard), P2Background (shed first)
+- `ResourceBudget` — max RSS, wall time, token budget, warning threshold
+- `TaskEnvelope` v1 — task spec, checkpoint policy, tool endpoints
 
-| Component | Description |
-|-----------|-------------|
-| **AdmissionController** | Enforces CPU/RAM/pressure limits before scheduling |
-| **ResourceAllocator** | Thread-safe tracking of allocated resources (`Arc<Mutex<>>`) |
-| **Recommender** | Calculates max agents based on hardware + pressure headroom |
+### Resource Governor (`src/governor/`)
+Two-phase resource management: admission control + runtime budget enforcement.
 
-Resource requirements per agent type:
-- **Claude CLI**: 500mc CPU, 250MB RAM
-- **Shell**: 200mc CPU, 50MB RAM
+- **Admission**: queue, throttle, shed based on priority and system pressure
+- **Budget**: per-tier token tracking (P0 reserved, P1 pool, P2 spare capacity)
+- System-wide RSS ceiling with headroom reserve
 
-Pressure-aware headroom multiplier: Normal=1x, Warn=1.75x, Critical=2.5x.
+### Model Adapter (`src/adapter/`)
+Unified interface for all LLM interactions with capability-based provider resolution.
+
+- `ModelAdapter` trait — `complete()`, `health()`, `budget()`
+- **Circuit breaker** per provider (Closed → Open → HalfOpen)
+- **Provider resolver** — capabilities + zone + health + adversarial constraint → best available
+- **Capability matching** — context window, tool use, vision, streaming, quality tier
+- **Degradation tracking** — None/Mild/Significant based on fallback position
+- Request/response schemas with context attribution (L1–L4 memory tiers)
+
+### State Store (`src/store/`)
+SQLite/WAL-backed key-value store with ACL enforcement.
+
+- `StateStore` trait — get/put/delete/list/exists on namespaced keys
+- `SqliteStateStore` — WAL mode, configurable checkpoint policy
+- `ProcessIdentity` ACL — per-process write permissions on key prefixes
+
+### JSON-RPC Dispatch (`src/dispatch/`)
+Unix domain socket communication between kernel and loop processes.
+
+- **Protocol** — JSON-RPC 2.0 over newline-delimited UDS
+- **Methods** — task.submit, task.progress, task.complete, task.cancel, loop.trigger, ping
+- **Loop trigger contracts** — TaskDispatch, TaskProgress, TaskComplete, TaskFailed, TaskCancel, MetaCycleRequest, MetaCycleAuthorized, MetaCycleComplete
+- **Socket convention** — `{state_dir}/sockets/kernel.sock`, `loop0.sock`, `loop1-{task_id}.sock`, `loop2.sock`, `adapter-model.sock`
 
 ### DAG Engine (`src/dag/`)
+Directed acyclic graph executor with parallel task dispatch and crash recovery.
 
-| Component | Description |
-|-----------|-------------|
-| **DagGraph** | Directed acyclic graph with cycle detection (DFS) and topological sort (Kahn's) |
-| **DagExecutor** | Async parallel task execution via Tokio, respects max_parallel |
-| **RuntimeDag** | `Arc<RwLock<>>` wrapper for safe concurrent mutation with rollback |
-| **DagPersistence** | JSON checkpoint/resume with crash recovery (InProgress → Pending) |
+- Cycle detection (DFS), topological sort (Kahn's algorithm)
+- Async parallel execution via Tokio with `max_parallel` limit
+- JSON checkpoint/resume with crash recovery (InProgress → Pending on reload)
 
-Node states: `Pending → InProgress → Done | Failed | Blocked`
+### Hardware Monitor (`src/hardware/`)
+System resource probing with memory pressure detection.
+
+- CPU count, total/available RAM, load averages (2s cached snapshots)
+- macOS-specific pressure detection via `sysctl`
+- Pressure levels: Normal, Warn, Critical
+
+### Scheduler (`src/scheduler/`)
+Legacy admission controller and resource allocator (being superseded by governor).
 
 ### Agent (`src/agent/`)
+Agent type abstraction with subprocess management.
 
-| Component | Description |
-|-----------|-------------|
-| **AgentType** trait | `execute(task, timeout)` + `resource_requirements()` |
-| **AgentState** | Finite state machine: Idle → Busy → Done/Failed → Reset |
-| **ClaudeCliAgent** | Subprocess management with stdin/stdout piping, timeout |
-| **ShellAgent** | `/bin/sh -c` execution with working directory support |
+- `AgentType` trait — `execute(task, timeout)` + `resource_requirements()`
+- `ClaudeCliAgent` — Claude CLI subprocess with stdin/stdout piping
+- `ShellAgent` — `/bin/sh -c` execution
 
 ## Usage
 
@@ -76,33 +106,44 @@ Node states: `Pending → InProgress → Done | Failed | Blocked`
 # Build
 cargo build --release
 
-# Run tests
+# Run the kernel daemon
+cargo run -- run --state-dir ./aros-state
+
+# Run all tests
 cargo test
 
-# Show recommended agent capacity
-cargo run -- recommend
+# Run specific module tests
+cargo test adapter
+cargo test store
+cargo test supervisor
 
-# Show system status
-cargo run -- status
+# Clippy (allow pre-existing module_inception in governor)
+cargo clippy -- -D warnings -A clippy::module_inception
 ```
 
-## Key Design Decisions
+## Integration with aros-sie
 
-- **Zero external runtime deps** beyond tokio, sysinfo, serde — minimal footprint for headless Mac Mini
-- **Pressure-aware scheduling** — rejects all work at Critical pressure, scales headroom dynamically
-- **Crash recovery** — DAG checkpoints reset InProgress nodes to Pending on reload
-- **Thread-safe by default** — `Arc<Mutex<>>` / `Arc<RwLock<>>` throughout
-- **Trait-based agents** — `AgentType` trait enables custom agent backends
+The kernel's Loop 0 orchestrator calls into the SIE's trait-based abstractions:
 
-## Test Suite
+| SIE Trait | Kernel Usage |
+|-----------|-------------|
+| `SelfModel` | SELF-MODEL UPDATE step |
+| `Critic` | CRITIQUE step |
+| `PolicyStore` | POLICY REVISION step |
+| `IdentityChecker` | IDENTITY CHECK step |
+| `StateStore` | SIE persistence (kernel provides SQLite/WAL impl) |
 
-9 test files covering:
-- DAG parallel dispatch and dependency resolution
-- Admission control under memory pressure
-- Agent lifecycle state transitions
-- Thread-safety with concurrent allocations
-- Stress tests and edge cases
-- Checkpoint save/load and crash recovery
+State store keys for SIE data:
+- `sie/identity/last_drift` — latest drift score (UI drift gauge)
+- `sie/policy/head` — current policy snapshot ID (Evolution Timeline)
+- `sie/meta/last_cycle` — latest meta-cycle ID
+
+## Tech Stack
+
+- Rust (edition 2024)
+- tokio, serde, serde_json, tracing, tracing-subscriber, thiserror
+- rusqlite (bundled SQLite), sysinfo, clap, libc
+- uuid, chrono
 
 ## License
 
