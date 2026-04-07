@@ -5,9 +5,11 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use tokio::sync::watch;
 
+use aros_kernel::dispatch::RpcServer;
 use aros_kernel::governor::{GovernorConfig, ResourceGovernor};
 use aros_kernel::hardware::{pressure, probe};
 use aros_kernel::store::SqliteStateStore;
+use aros_kernel::supervisor::handler::{KernelRequestHandler, TaskRegistry};
 use aros_kernel::supervisor::kernel::KernelSupervisor;
 use aros_kernel::supervisor::process::{ProcessId, ProcessState, RestartPolicy};
 
@@ -175,8 +177,29 @@ async fn run_daemon(
     governor.update_pressure(initial_pressure.level).await;
     tracing::info!("resource governor initialized");
 
+    // ── Task registry ───────────────────────────────────────────────
+    let task_registry = Arc::new(TaskRegistry::new());
+
     // ── Boot sequence ──────────────────────────────────────────────
     boot_sequence(&supervisor).await?;
+
+    // ── Kernel RPC server ──────────────────────────────────────────
+    let sockets_dir = state_path.join("sockets");
+    std::fs::create_dir_all(&sockets_dir).expect("failed to create sockets directory");
+
+    let handler = KernelRequestHandler::new(
+        supervisor.clone(),
+        governor.clone(),
+        task_registry.clone(),
+    );
+    let rpc_server = Arc::new(RpcServer::new(sockets_dir.join("kernel.sock")));
+    let rpc_server_ref = rpc_server.clone();
+    let rpc_handle = tokio::spawn(async move {
+        if let Err(e) = rpc_server_ref.serve(handler).await {
+            tracing::error!("RPC server error: {e}");
+        }
+    });
+    tracing::info!(path = %sockets_dir.join("kernel.sock").display(), "kernel RPC server started");
 
     // ── Health check loop ──────────────────────────────────────────
     let health_handle = tokio::spawn(health_loop(
@@ -193,6 +216,12 @@ async fn run_daemon(
 
     // ── Graceful shutdown ──────────────────────────────────────────
     tracing::info!("shutdown signal received");
+
+    // Shut down RPC server first (stop accepting new requests)
+    rpc_server.shutdown();
+    let _ = rpc_handle.await;
+    tracing::info!("RPC server stopped");
+
     graceful_shutdown(&supervisor).await?;
 
     // Wait for health loop to exit
