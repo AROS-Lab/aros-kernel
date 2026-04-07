@@ -1,163 +1,143 @@
 # AROS Kernel
 
-The kernel layer of the **Agent Runtime Operating System (AROS)** — a constellation-model runtime for AI agents with hardware-aware scheduling, self-improvement coordination, and safety-enforced execution.
+Hardware-aware agent runtime engine for the AROS (Agent Runtime OS) ecosystem. The kernel manages the full lifecycle of AI agent execution — from hardware probing and admission control through DAG orchestration to supervised process management — on resource-constrained systems.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          AROS Kernel                                │
-│                                                                     │
-│  ┌─────────────┐  ┌──────────────┐  ┌──────────────────────────┐  │
-│  │  Supervisor  │  │   Resource   │  │     JSON-RPC Dispatch    │  │
-│  │    Tree      │  │   Governor   │  │   (Unix Domain Sockets)  │  │
-│  │             │  │              │  │                          │  │
-│  │  Init       │  │  Admission   │  │  kernel.sock  (hub)     │  │
-│  │  └─ Kernel  │  │  + Runtime   │  │  loop0.sock   (meta)    │  │
-│  │     └─ Loops│  │  + Budget    │  │  loop1-*.sock (agentic) │  │
-│  │     └─ Adpt │  │              │  │  loop2.sock   (harness) │  │
-│  └─────────────┘  └──────────────┘  └──────────────────────────┘  │
-│                                                                     │
-│  ┌─────────────┐  ┌──────────────┐  ┌──────────────────────────┐  │
-│  │ State Store  │  │    Task      │  │    Model Adapter         │  │
-│  │ SQLite/WAL   │  │  Envelope    │  │    (Sidecar)             │  │
-│  │ + ACL Guard  │  │  + Security  │  │                          │  │
-│  │              │  │    Zones     │  │  Circuit breaker          │  │
-│  │  Per-process │  │  + Priority  │  │  Provider resolution     │  │
-│  │  write perms │  │    Tiers     │  │  Zone-aware routing      │  │
-│  └─────────────┘  └──────────────┘  └──────────────────────────┘  │
-│                                                                     │
-│  ┌─────────────┐  ┌──────────────┐  ┌──────────────────────────┐  │
-│  │  Hardware    │  │  Scheduler   │  │     DAG Engine           │  │
-│  │  Monitor     │  │  Admission   │  │  Async parallel executor │  │
-│  │  + Pressure  │  │  Control     │  │  Checkpoint/resume       │  │
-│  └─────────────┘  └──────────────┘  └──────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                         AROS Kernel                             │
+│                                                                 │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐ │
+│  │  Supervisor  │    │  Resource   │    │   JSON-RPC          │ │
+│  │  Tree        │───▶│  Governor   │───▶│   Dispatch          │ │
+│  │  (init→loop) │    │  (2-phase)  │    │   (UDS server)      │ │
+│  └─────────────┘    └─────────────┘    └─────────────────────┘ │
+│        │                   │                     │              │
+│        ▼                   ▼                     ▼              │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐ │
+│  │  Task        │    │  Hardware   │    │   Loop Contracts    │ │
+│  │  Envelope    │    │  Monitor    │    │   (triggers)        │ │
+│  │  (zones)     │    │  (pressure) │    │                     │ │
+│  └─────────────┘    └─────────────┘    └─────────────────────┘ │
+│        │                   │                     │              │
+│        ▼                   ▼                     ▼              │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                    State Store (SQLite/WAL)               │  │
+│  │                    + ACL Enforcement                      │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│        │                                                        │
+│        ▼                                                        │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  DAG Executor  │  Agent Lifecycle  │  Model Adapter      │  │
+│  │  (parallel)    │  (Shell/Claude)   │  (circuit breaker)  │  │
+│  └──────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+## Three-Loop Model
+
+The kernel orchestrates three execution loops:
+
+| Loop | Name | Purpose |
+|------|------|---------|
+| **Loop 0** | Meta | Self-improvement cycle (PERCEIVE → CRITIQUE → REVISE → CHECK → PERSIST) |
+| **Loop 1** | Agentic | Single-task agent execution (one subprocess per task) |
+| **Loop 2** | Harness | DAG orchestration — dispatches tasks to Loop 1 subprocesses |
+
+Inter-loop communication uses JSON-RPC 2.0 over Unix domain sockets, with the kernel as the routing hub.
 
 ## Modules
 
-### Supervisor Tree (`src/supervisor/`)
+### Supervisor (`src/supervisor/`)
 
-Two-level supervisor: Init (OS-managed, immortal) → Kernel (checkpoint-recoverable) → Loops (ephemeral).
+Process lifecycle management with ordered startup and graceful shutdown.
 
 | Component | Description |
 |-----------|-------------|
-| **ProcessId** | Registry of supervised processes (Init, Kernel, Loop0–2, ModelAdapter, EmbeddingAdapter) |
+| **KernelSupervisor** | Registers and tracks all processes (Init, Kernel, Loops 0-2, Adapters) |
 | **ProcessState** | State machine: Starting → Running → Stopping → Stopped → Failed → Restarting |
 | **RestartPolicy** | Exponential backoff with configurable max restarts and window |
-| **KernelSupervisor** | Health aggregation (Healthy/Degraded/Recovering), process lifecycle management |
-| **KernelRequestHandler** | JSON-RPC router: task admission, progress tracking, trigger routing, budget enforcement |
-| **TaskRegistry** | Tracks active Loop 1 instances (task_id → socket_path) |
-
-### State Store (`src/store/`)
-
-SQLite with WAL mode for single-node persistence. Designed for future distributed backends (etcd/FoundationDB).
-
-| Component | Description |
-|-----------|-------------|
-| **StateStore** trait | Key-value contract: `put`, `get`, `delete`, `list_keys`, `exists`, `transaction` |
-| **SqliteStateStore** | WAL mode, dual-trigger checkpointing (write count OR elapsed seconds), hard WAL ceiling |
-| **AclGuard** | Kernel-enforced per-process write permissions by key prefix |
-| **ProcessIdentity** | Caller identity for ACL enforcement (Kernel, MetaLoop, HarnessLoop, AgenticLoop, ModelAdapter, Human) |
-
-**ACL Rules:**
-
-| Key Prefix | Write Access | Notes |
-|------------|-------------|-------|
-| `/policy/*` | MetaLoop | Two-step commit: staging → kernel validation → promote |
-| `/meta-goals/*` | Human only | Identity constraints are human-owned |
-| `/audit/*` | Append-only | All identities can append, none can delete |
-| `/evolution-log/*` | MetaLoop (append-only) | Branching policy archive |
-| `/circuit-breaker/*` | ModelAdapter | Provider health state |
-| `/dag/*` | HarnessLoop | DAG execution state |
-| `/task/*` | AgenticLoop | Task execution state |
-| `/self-model/*` | MetaLoop | Bayesian capability model |
-| `/security/redzone/*` | Read-only | Kernel invariants, no writes permitted |
-
-### JSON-RPC Dispatch (`src/dispatch/`)
-
-Inter-loop communication over Unix domain sockets using JSON-RPC 2.0.
-
-| Component | Description |
-|-----------|-------------|
-| **RpcServer** | Unix socket server with newline-delimited JSON-RPC, graceful shutdown, per-connection isolation |
-| **RpcClient** | Unix socket client with auto-incrementing request IDs |
-| **RpcMethod** | `task.submit`, `task.progress`, `task.complete`, `task.cancel`, `loop.trigger`, `ping` |
-| **LoopTrigger** | Typed trigger envelope with ProcessId routing, sequence numbers, W3C trace context |
-| **TriggerKind** | All inter-loop flows: TaskDispatch, TaskProgress/Complete/Failed, TaskCancel, MetaCycle lifecycle |
-| **TriggerSink** | Trait for kernel-side trigger routing |
-
-**Socket Convention:**
-```
-{state_dir}/sockets/kernel.sock          — Kernel event bus (all loops connect here)
-{state_dir}/sockets/loop0.sock           — Loop 0 (Meta), long-lived sidecar
-{state_dir}/sockets/loop1-{task_id}.sock — Loop 1 (Agentic), per-task ephemeral
-{state_dir}/sockets/loop2.sock           — Loop 2 (Harness), long-lived
-{state_dir}/sockets/adapter-model.sock   — Model adapter sidecar
-{state_dir}/sockets/adapter-embed.sock   — Embedding adapter sidecar
-```
+| **HealthStatus** | Aggregated health: Healthy / Degraded / Recovering |
+| **KernelRequestHandler** | Routes JSON-RPC triggers between loops with process validation |
 
 ### Task Envelope (`src/envelope/`)
 
-Versioned contract for Loop 2 → Loop 1 task dispatch.
+Versioned task schema with security and resource constraints.
 
 | Component | Description |
 |-----------|-------------|
-| **TaskEnvelope** | task_id, dag_id, task_spec, security_zone, priority, resource_budget, tool_endpoints, checkpoint_policy |
-| **SecurityZone** | Green (any provider), Yellow (approved only), Red (local only, airgapped) |
-| **Priority** | P0Critical (Loop 0/health, always admitted), P1Normal (task execution), P2Background (SIE, first to shed) |
-| **ResourceBudget** | max_rss_mb, max_wall_time, max_tokens, budget_warning_threshold |
+| **TaskEnvelope** | Wraps every task with metadata: security zone, priority, budget, tools |
+| **SecurityZone** | Green (any provider) / Yellow (approved only) / Red (local only) |
+| **Priority** | P0 Critical (never shed) / P1 Normal / P2 Background (shed first) |
+| **ResourceBudget** | Per-task limits: max RSS, wall time, tokens, warning threshold |
 
 ### Resource Governor (`src/governor/`)
 
-Two-phase resource management: admission control (can I start?) + runtime monitoring (are you within budget?).
+Two-phase resource control with priority-aware enforcement.
 
 | Component | Description |
 |-----------|-------------|
-| **ResourceGovernor** | Admission (admit/queue/throttle/shed) + runtime budget enforcement |
-| **TierBudget** | Per-priority resource allocation (P0: never shed, P2: shed first) |
-| **TierUsage** | Real-time atomic tracking of active tasks, tokens, RSS |
-| **AdmissionDecision** | Admit / Queue / Throttle / Shed based on pressure + priority |
+| **ResourceGovernor** | Phase 1: admission (queue → throttle → shed). Phase 2: runtime budget |
+| **TierBudget** | Per-priority budgets: max concurrent, RSS ceiling, hourly tokens |
+| **AdmissionDecision** | Admitted / Queued / Throttled / Shed |
+| **RuntimeDecision** | Continue / Warning / Exceeded |
 
-Ordering under pressure: queue → throttle → shed. P0 has reserved non-lendable budget.
+### JSON-RPC Dispatch (`src/dispatch/`)
+
+Inter-loop communication over Unix domain sockets.
+
+| Component | Description |
+|-----------|-------------|
+| **RpcServer** | Newline-delimited JSON-RPC server with per-connection isolation |
+| **RpcClient** | Client with auto-incrementing request IDs |
+| **LoopTrigger** | Routable trigger with source/target `ProcessId` and W3C trace context |
+| **TriggerKind** | TaskDispatch, TaskProgress, TaskComplete, TaskFailed, TaskCancel, MetaCycle* |
+
+### State Store (`src/store/`)
+
+SQLite/WAL-backed key-value persistence with ACL enforcement.
+
+| Component | Description |
+|-----------|-------------|
+| **SqliteStateStore** | WAL mode, dual-trigger checkpointing (write count + elapsed time) |
+| **AclGuard** | Per-process write permissions via key-prefix ACL rules |
+| **StateStore** trait | Generic interface for storage backends |
 
 ### Model Adapter (`src/adapter/`)
 
-Supervised sidecar for LLM provider abstraction.
+Supervised sidecar for LLM provider routing with fault tolerance.
 
 | Component | Description |
 |-----------|-------------|
-| **ModelAdapter** trait | `complete()`, `health()`, `budget()` — capability-based, callers never name a model directly |
-| **ProviderResolver** | Zone filter → capability filter → health filter → adversarial constraint → fallback rank sort |
-| **CircuitBreaker** | Per-provider: Closed → HalfOpen → Open. Recovers to HalfOpen on kernel restart |
-| **ProviderRegistry** | Provider tracking with health aggregation (Healthy/Degraded/AllProvidersDown) |
-| **QualityTier** | Haiku / Sonnet / Opus capability levels |
+| **ModelAdapter** trait | `complete()`, `health()`, `budget()` for provider interaction |
+| **ProviderResolver** | Zone filter → capability filter → health filter → adversarial constraint → fallback rank |
+| **CircuitBreaker** | Per-provider: Closed → Open → HalfOpen with configurable thresholds |
+| **ProviderRegistry** | Tracks all providers with health aggregation |
 
-### Hardware Monitor (`src/hardware/`)
+### Hardware (`src/hardware/`)
 
 | Component | Description |
 |-----------|-------------|
 | **SystemResources** | CPU count, total/available RAM, load averages (2s cache) |
-| **MemoryPressureLevel** | Normal / Warn / Critical via macOS `sysctl` |
+| **MemoryPressureLevel** | Normal / Warn / Critical via macOS `sysctl` or RAM ratio fallback |
 | **HardwareSnapshot** | Timestamped system state, serializable to JSON |
 
 ### Scheduler (`src/scheduler/`)
 
 | Component | Description |
 |-----------|-------------|
-| **AdmissionController** | Enforces CPU/RAM/pressure limits before scheduling |
-| **ResourceAllocator** | Thread-safe resource tracking (`Arc<Mutex<>>`) |
-| **Recommender** | Max agent calculation based on hardware + pressure headroom |
+| **AdmissionController** | CPU/RAM/pressure gate before scheduling |
+| **ResourceAllocator** | Thread-safe resource tracking |
+| **Recommender** | Max agent capacity based on hardware + pressure headroom |
 
 ### DAG Engine (`src/dag/`)
 
 | Component | Description |
 |-----------|-------------|
-| **DagGraph** | Directed acyclic graph with DFS cycle detection and Kahn's topological sort |
-| **DagExecutor** | Async parallel task execution via Tokio, respects max_parallel |
-| **RuntimeDag** | `Arc<RwLock<>>` wrapper for safe concurrent mutation |
-| **DagPersistence** | JSON checkpoint/resume with crash recovery (InProgress → Pending) |
+| **DagGraph** | Directed acyclic graph with cycle detection and topological sort |
+| **DagExecutor** | Async parallel execution via Tokio |
+| **DagPersistence** | JSON checkpoint/resume with crash recovery |
 
 ### Agent (`src/agent/`)
 
@@ -165,48 +145,70 @@ Supervised sidecar for LLM provider abstraction.
 |-----------|-------------|
 | **AgentType** trait | `execute(task, timeout)` + `resource_requirements()` |
 | **AgentState** | FSM: Idle → Busy → Done/Failed → Reset |
-| **ClaudeCliAgent** | Subprocess management with stdin/stdout piping, timeout |
+| **ClaudeCliAgent** | Subprocess management with stdin/stdout piping |
 | **ShellAgent** | `/bin/sh -c` execution with working directory support |
 
-## Usage
+## Daemon
+
+The kernel runs as an async daemon (`aros-kernel run`):
 
 ```bash
-# Build
+# Run the kernel daemon (default)
+aros-kernel run --state-dir ~/.aros/state --health-interval 5
+
+# Show recommended agent capacity
+aros-kernel recommend
+
+# Show system status
+aros-kernel status
+```
+
+Boot sequence: Init → Kernel → Loop 0/1/2 → Model Adapter → Embedding Adapter
+
+Shutdown: reverse order with cooperative signal handling (SIGTERM/SIGINT).
+
+## Socket Layout
+
+```
+{state_dir}/sockets/
+├── kernel.sock              # Kernel event bus (hub)
+├── loop0.sock               # Loop 0 (Meta) — long-lived
+├── loop1-{task_id}.sock     # Loop 1 (Agentic) — per-task, ephemeral
+├── loop2.sock               # Loop 2 (Harness) — long-lived
+├── adapter-model.sock       # Model adapter sidecar
+└── adapter-embed.sock       # Embedding adapter sidecar
+```
+
+## Building
+
+```bash
 cargo build --release
-
-# Run the kernel daemon
-cargo run -- run --state-dir /tmp/aros-state
-
-# Run tests
 cargo test
-
-# Options
-cargo run -- run --state-dir ./data --health-interval 10 --log-level debug
 ```
 
 ## Test Suite
 
-167 tests across 10 modules covering:
-- SQLite/WAL operations, checkpointing, transactions
-- ACL enforcement for every key prefix, append-only rules
-- JSON-RPC client/server round-trips, concurrent connections
-- Loop trigger serialization and routing
-- Task envelope validation and serde
-- Supervisor state machine transitions, restart backoff
-- Governor admission under pressure, budget enforcement
-- Circuit breaker state transitions
-- DAG parallel dispatch, dependency resolution, crash recovery
-- Hardware pressure detection, agent lifecycle
+166 tests across 10 modules covering:
+- Supervisor process lifecycle and restart policies
+- Task envelope validation and serialization
+- Governor admission/runtime decisions under pressure
+- JSON-RPC protocol, client/server, concurrent connections
+- State store CRUD, ACL enforcement, WAL checkpointing
+- Model adapter circuit breaker and provider resolution
+- DAG parallel dispatch and dependency resolution
+- Hardware pressure detection and admission control
+- Agent lifecycle state transitions
+- MetaCycleComplete state persistence
 
 ## Tech Stack
 
-- **Language:** Rust (Edition 2024)
-- **Async runtime:** Tokio
-- **Persistence:** SQLite with WAL mode (rusqlite)
-- **IPC:** JSON-RPC 2.0 over Unix domain sockets
-- **Serialization:** serde + serde_json
-- **Telemetry:** tracing + tracing-subscriber
-- **Hardware:** sysinfo + libc (macOS sysctl)
+- **Language**: Rust (Edition 2024)
+- **Async runtime**: Tokio
+- **State store**: SQLite with WAL mode (via rusqlite)
+- **IPC**: JSON-RPC 2.0 over Unix domain sockets
+- **Serialization**: serde + serde_json
+- **Instrumentation**: tracing
+- **Target**: macOS (Apple Silicon), with Linux fallbacks
 
 ## License
 
