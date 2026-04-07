@@ -1,5 +1,5 @@
 use crate::hardware::probe::SystemResources;
-use super::admission::MemoryPressureLevel;
+use crate::hardware::pressure::MemoryPressureLevel;
 
 pub struct Recommender {
     ram_headroom_base_mb: u32,

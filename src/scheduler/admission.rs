@@ -1,14 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::allocator::ResourceAllocator;
-
-// TODO: Replace with crate::hardware::pressure::MemoryPressureLevel when available
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemoryPressureLevel {
-    Normal,
-    Warn,
-    Critical,
-}
+// Re-exported so downstream code can still import from scheduler::admission
+pub use crate::hardware::pressure::MemoryPressureLevel;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceRequirements {
