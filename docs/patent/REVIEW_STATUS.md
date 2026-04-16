@@ -82,6 +82,34 @@ Claims: 24 total. Alice/Mayo §101 analysis included. 13 drawings listed
 
 ---
 
+## Addendum — Phase 1 kernel work post-dating the draft (FLAGGED GAP)
+
+**Update after rebasing local:** origin/main has 13 commits dated 2026-04-06, all
+landed AFTER the patent draft was written (2026-03-24). Six new Rust modules exist
+that may contain patentable subject matter not covered by the current draft:
+
+| Module | Files | Possible novelty vs existing claims |
+|---|---|---|
+| `src/supervisor/` | process, kernel, handler, health | Erlang-style supervisor tree for agent lifecycle — not in current claims |
+| `src/store/` | engine (SQLite/WAL), acl | ACL-enforced state store; Claim 3 covers metric-store read-only perms but not general state ACL |
+| `src/dispatch/` | rpc, server, contracts | JSON-RPC "loop trigger contracts" for external loop invocation — not in claims |
+| `src/governor/` | admission, budget, governor | Consolidated resource governor; extends Claim 4 token budget to unified admission |
+| `src/adapter/` | circuit_breaker, provider, resolver | Model adapter sidecar with circuit breaker; extends Claim 4 cost-aware router |
+| `src/envelope/` | task_envelope | Serializable task envelope; potentially a concrete realization of Claim 12 UEI |
+| commit `8201895` | (scheduler integration) | Persisting SIE drift score + policy head on MetaCycleComplete — new feedback signal beyond §4.5's seven channels |
+
+**Recommendation for Eddie:** Before filing provisional, decide whether to:
+- (a) File current draft as-is; cover new modules via continuation patent or CIP
+- (b) Supplement current draft with a §4.20 "Phase 1 Realization Architecture" section
+      enumerating these mechanisms, then file
+- (c) Have counsel review the Phase 1 code and advise on claim scope
+
+Note: once the provisional is filed, only material disclosed in it gets the priority
+date. New matter in a later non-provisional or CIP gets a later date. Erring toward
+over-disclosure in the provisional is the conservative move.
+
+---
+
 ## What I did NOT do (scope fence)
 
 - Did not submit anything to USPTO.
