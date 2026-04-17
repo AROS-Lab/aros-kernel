@@ -460,6 +460,111 @@ async fn test_concurrent_clients() {
 }
 
 // ---------------------------------------------------------------------------
+// Error-path coverage (GAP_ANALYSIS.md gap #1)
+// ---------------------------------------------------------------------------
+
+/// Handler that always returns an explicit error tuple.
+#[derive(Clone)]
+struct AlwaysErrHandler;
+
+impl RequestHandler for AlwaysErrHandler {
+    async fn handle(
+        &self,
+        _method: RpcMethod,
+        _params: Option<Value>,
+    ) -> Result<Value, (i32, String)> {
+        Err((ERROR_BUDGET_EXCEEDED, "simulated budget exhaustion".to_string()))
+    }
+}
+
+#[tokio::test]
+async fn test_malformed_json_returns_parse_error() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("malformed.sock");
+
+    let server = RpcServer::new(sock_path.clone());
+    tokio::spawn(async move {
+        server.serve(PingHandler).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Send raw garbage that is not valid JSON.
+    let stream = UnixStream::connect(&sock_path).await.unwrap();
+    let (reader, mut writer) = stream.into_split();
+    writer.write_all(b"{this is not json\n").await.unwrap();
+    writer.flush().await.unwrap();
+
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+
+    let resp: JsonRpcResponse = serde_json::from_str(&line).unwrap();
+    let err = resp.error.expect("Expected parse error response");
+    assert_eq!(err.code, ERROR_PARSE);
+    assert!(err.message.to_lowercase().contains("parse"));
+    // On parse error the id is Null because we couldn't recover it from the request.
+    assert_eq!(resp.id, Value::Null);
+}
+
+#[tokio::test]
+async fn test_handler_error_propagates_to_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("handler_err.sock");
+
+    let server = RpcServer::new(sock_path.clone());
+    tokio::spawn(async move {
+        server.serve(AlwaysErrHandler).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = RpcClient::connect(&sock_path).await.unwrap();
+    let resp = client.call("ping", None).await.unwrap();
+
+    let err = resp.error.expect("Expected handler error response");
+    assert_eq!(err.code, ERROR_BUDGET_EXCEEDED);
+    assert!(err.message.contains("budget"));
+    // The request id must be preserved end-to-end so the client can correlate.
+    assert_eq!(resp.id, Value::Number(1.into()));
+}
+
+#[tokio::test]
+async fn test_server_handles_client_disconnect_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("disconnect.sock");
+
+    let server = RpcServer::new(sock_path.clone());
+    tokio::spawn(async move {
+        server.serve(PingHandler).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Connect, send, drop (simulating client crash mid-session).
+    {
+        let mut client = RpcClient::connect(&sock_path).await.unwrap();
+        let resp = client.call("ping", None).await.unwrap();
+        assert!(resp.error.is_none());
+    } // client dropped here
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Server must still accept a new connection after the abrupt disconnect.
+    let mut client2 = RpcClient::connect(&sock_path).await.unwrap();
+    let resp = client2.call("ping", None).await.unwrap();
+    assert!(resp.error.is_none());
+    assert_eq!(resp.result.unwrap(), "pong");
+}
+
+// Note: a server-shutdown test was attempted but RpcServer::new creates a fresh
+// broadcast channel per instance, so signaling shutdown requires the same
+// instance that is calling serve(). The current test file spawns the server
+// inside an async block that moves ownership, making external shutdown awkward
+// without an API change. Deferred until `serve()` takes a shutdown token or
+// returns a handle. See GAP_ANALYSIS.md gap #1.
+
+// ---------------------------------------------------------------------------
 // TriggerError display
 // ---------------------------------------------------------------------------
 
