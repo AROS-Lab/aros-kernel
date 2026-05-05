@@ -4,3 +4,7 @@ Cargo.lock
 *.swo
 *~
 .DS_Store
+
+# Local distribution artifacts (CI publishes the official ones via release.yml).
+/dist/aros-kernel-*
+/dist/SHA256SUMS

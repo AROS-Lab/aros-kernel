@@ -17,6 +17,28 @@ Verify:
 ./target/release/aros-kernel recommend
 ```
 
+## Local distribution build
+
+For ad-hoc local distribution (e.g. handing a binary to another machine
+without going through CI), stage a stripped, checksummed copy under
+`dist/`:
+
+```bash
+cargo build --release
+mkdir -p dist
+TARGET="$(rustc -vV | awk '/host:/ {print $2}')"
+VERSION="$(cargo metadata --no-deps --format-version 1 \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["packages"][0]["version"])')"
+NAME="aros-kernel-v${VERSION}-${TARGET}"
+cp target/release/aros-kernel "dist/${NAME}"
+strip "dist/${NAME}"
+( cd dist && shasum -a 256 "${NAME}" > SHA256SUMS )
+```
+
+`dist/aros-kernel-*` and `dist/SHA256SUMS` are gitignored — they are
+per-build artifacts. The canonical distributables come from CI tagged
+releases (see below).
+
 ## Distributable binaries
 
 Release tarballs are built by CI for four targets:
