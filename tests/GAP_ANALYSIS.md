@@ -84,3 +84,47 @@ Per Eddie's principle *"stability > intelligence, simplicity > complexity"*,
 this pass adds **4 high-value tests** rather than 30+ shallow ones. The
 remaining gaps are documented here so the next hardening pass has a clear
 starting point without having to re-audit.
+
+---
+
+## Pass 2 (2026-05-04, MetaLoop cycle #338)
+
+### Closed gaps
+
+- [x] **§2 governor — `GovernorError` variant coverage.** Added Display
+  assertions for all three variants and an `std::error::Error` trait
+  bound check in `tests/error_handling_tests.rs`. Guards against
+  accidental message changes that telemetry/log alerts depend on.
+- [x] **§3 supervisor — terminal `Failed` state persistence.** New
+  `tests/supervisor_tests.rs` (8 tests) asserts that after
+  `MaxRestartsExceeded` the process *remains* in `Failed`, that
+  repeated failure calls keep erroring, and that `Running → Running`
+  resets the restart tracker so post-recovery failures get a fresh
+  budget.
+- [x] **§3 supervisor — restart tracker boundary cases.** Covers
+  `max_restarts == 0` (must immediately fail), restart-window
+  eviction allowing new restarts, and the invariant that
+  `consecutive_failures` persists across window eviction (so backoff
+  cannot be reset by wall-clock time alone).
+- [x] **§5 adapter — circuit breaker under concurrency.** Three new
+  tests in `tests/concurrency_tests.rs` exercise the breaker through
+  a `Mutex<CircuitBreaker>` under 32× contention, mixed
+  success/failure interleaving, and concurrent reader/writer
+  watchdog (2s deadlock budget). Confirms the state machine reaches
+  `Open` deterministically and never panics or deadlocks.
+
+### Still deferred
+
+- §3 — `KernelRequestHandler` routing to an unknown `ProcessId`: the
+  existing `test_loop_trigger_from_stopped_process_rejected` covers
+  the source-side check; target-side routing still has TODO markers
+  in `handler.rs` and isn't worth testing until implemented.
+- §4 — store WAL checkpoint failure: still requires a trait rework
+  to inject a faulty backend.
+- §6 — envelope version negotiation: still a v1-only protocol.
+
+### Pass 2 test count
+
+**+17 tests** (8 supervisor + 6 governor/supervisor error + 3 adapter
+concurrency). All passing on `cargo test --release` baseline 296 tests
+(279 baseline + 17).

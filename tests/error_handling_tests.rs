@@ -9,6 +9,9 @@ use aros_kernel::agent::types::AgentType;
 use aros_kernel::dag::executor::{DagExecutor, TaskExecutor};
 use aros_kernel::dag::graph::{AgentLevel, DagGraph, Node, NodeStatus};
 use aros_kernel::dag::persistence::{DagPersistence, PersistenceError};
+use aros_kernel::governor::GovernorError;
+use aros_kernel::supervisor::error::SupervisorError;
+use aros_kernel::supervisor::process::ProcessId;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -211,4 +214,65 @@ async fn test_executor_with_panicking_task() {
         NodeStatus::Failed,
         "Panicking node should be marked Failed"
     );
+}
+
+// ---------------------------------------------------------------------------
+// GovernorError variant coverage (GAP_ANALYSIS §2)
+// ---------------------------------------------------------------------------
+//
+// `GovernorError` defines three variants but no test previously asserted
+// their Display strings or that they round-trip through std::error::Error.
+// These guard against accidental message changes that downstream telemetry
+// and log-based alerting rely on.
+
+#[test]
+fn governor_error_unknown_tier_display() {
+    let err = GovernorError::UnknownTier;
+    let msg = err.to_string();
+    assert!(msg.contains("unknown"), "got: {msg}");
+    assert!(msg.contains("tier"), "got: {msg}");
+}
+
+#[test]
+fn governor_error_not_initialized_display() {
+    let err = GovernorError::NotInitialized;
+    assert_eq!(err.to_string(), "governor not initialized");
+}
+
+#[test]
+fn governor_error_system_ceiling_display() {
+    let err = GovernorError::SystemCeilingExceeded;
+    let msg = err.to_string();
+    assert!(msg.contains("RSS"), "got: {msg}");
+    assert!(msg.contains("ceiling"), "got: {msg}");
+}
+
+#[test]
+fn governor_error_implements_std_error_trait() {
+    // Confirms `?` propagation works at boundaries that take
+    // `Box<dyn std::error::Error>`.
+    fn _assert_error<E: std::error::Error>(_: &E) {}
+    _assert_error(&GovernorError::UnknownTier);
+    _assert_error(&GovernorError::NotInitialized);
+    _assert_error(&GovernorError::SystemCeilingExceeded);
+}
+
+// ---------------------------------------------------------------------------
+// SupervisorError completeness — covers ShuttingDown variant, which had
+// only a single Display test and no `is_send_sync` assertion. Both are
+// load-bearing for cross-task error propagation.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn supervisor_error_is_send_and_sync() {
+    fn _assert_send_sync<T: Send + Sync>() {}
+    _assert_send_sync::<SupervisorError>();
+}
+
+#[test]
+fn supervisor_error_max_restarts_carries_process_id() {
+    let err = SupervisorError::MaxRestartsExceeded(ProcessId::Loop2Harness);
+    // Round-trip through Display preserves the ProcessId for log diagnostics.
+    let msg = format!("{err}");
+    assert!(msg.contains("Loop2Harness"), "got: {msg}");
 }

@@ -9,6 +9,7 @@ use aros_kernel::hardware::pressure::{detect_from_ratio, MemoryPressureLevel};
 use aros_kernel::hardware::probe::probe_system;
 use aros_kernel::scheduler::admission::{AdmissionController, MemoryPressureLevel as AdmPressure, ResourceRequirements};
 use aros_kernel::scheduler::allocator::ResourceAllocator;
+use aros_kernel::adapter::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 use aros_kernel::agent::lifecycle::AgentState;
 
 use tempfile::TempDir;
@@ -349,4 +350,134 @@ fn test_allocator_interleaved() {
             panic!("DEADLOCK DETECTED: interleaved allocate/release did not complete within 2s");
         }
     }
+}
+
+// ── Circuit breaker concurrency (GAP_ANALYSIS §5) ───────────────────
+//
+// CircuitBreaker exposes &mut self transitions, so concurrent callers
+// must synchronize via Mutex. These tests assert that under contention
+// the state machine still reaches a deterministic terminal state and
+// never panics.
+
+#[test]
+fn circuit_breaker_concurrent_failures_open_exactly_once() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 3,
+        open_duration: Duration::from_secs(60), // long enough to avoid auto-transition
+        probe_success_count: 2,
+    };
+    let cb = Arc::new(Mutex::new(CircuitBreaker::new("racy-provider", config)));
+
+    let handles: Vec<_> = (0..32)
+        .map(|_| {
+            let cb = cb.clone();
+            thread::spawn(move || {
+                for _ in 0..5 {
+                    cb.lock().unwrap().record_failure();
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("circuit breaker thread panicked");
+    }
+
+    // After 32 × 5 = 160 failures with threshold 3, breaker must be Open.
+    let state = cb.lock().unwrap().state();
+    assert_eq!(
+        state,
+        CircuitState::Open,
+        "concurrent failures past threshold must leave breaker Open"
+    );
+}
+
+#[test]
+fn circuit_breaker_concurrent_mixed_success_failure_no_panic() {
+    // Exercises the state machine under concurrent record_success and
+    // record_failure calls. The exact terminal state is not deterministic
+    // (depends on interleaving), but the state machine must not panic
+    // and must always be in a valid CircuitState.
+    let cb = Arc::new(Mutex::new(CircuitBreaker::new(
+        "mixed",
+        CircuitBreakerConfig::default(),
+    )));
+
+    let handles: Vec<_> = (0..16)
+        .map(|i| {
+            let cb = cb.clone();
+            thread::spawn(move || {
+                for _ in 0..50 {
+                    let mut guard = cb.lock().unwrap();
+                    if i % 2 == 0 {
+                        guard.record_failure();
+                    } else {
+                        guard.record_success();
+                    }
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("mixed-record thread panicked");
+    }
+
+    let state = cb.lock().unwrap().state();
+    assert!(
+        matches!(
+            state,
+            CircuitState::Closed | CircuitState::HalfOpen | CircuitState::Open
+        ),
+        "state must remain a valid variant; got {state:?}"
+    );
+}
+
+#[test]
+fn circuit_breaker_concurrent_state_reads_under_failures() {
+    // Watchdog: concurrent state() and allows_request() reads while
+    // failures stream in must not deadlock. A 2s budget is generous
+    // for 32 short-lived threads on this machine.
+    let cb = Arc::new(Mutex::new(CircuitBreaker::new(
+        "reader-stress",
+        CircuitBreakerConfig {
+            failure_threshold: 5,
+            open_duration: Duration::from_secs(60),
+            probe_success_count: 2,
+        },
+    )));
+
+    let mut handles = Vec::new();
+
+    // Writers: record failures.
+    for _ in 0..8 {
+        let cb = cb.clone();
+        handles.push(thread::spawn(move || {
+            for _ in 0..50 {
+                cb.lock().unwrap().record_failure();
+            }
+        }));
+    }
+
+    // Readers: poll state.
+    for _ in 0..8 {
+        let cb = cb.clone();
+        handles.push(thread::spawn(move || {
+            for _ in 0..100 {
+                let _ = cb.lock().unwrap().allows_request();
+            }
+        }));
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let watchdog = thread::spawn(move || {
+        for h in handles {
+            h.join().expect("circuit breaker reader/writer panicked");
+        }
+        tx.send(()).unwrap();
+    });
+
+    rx.recv_timeout(Duration::from_secs(2))
+        .expect("DEADLOCK: circuit breaker reader/writer did not complete within 2s");
+    watchdog.join().unwrap();
 }
