@@ -128,3 +128,91 @@ starting point without having to re-audit.
 **+17 tests** (8 supervisor + 6 governor/supervisor error + 3 adapter
 concurrency). All passing on `cargo test --release` baseline 296 tests
 (279 baseline + 17).
+
+---
+
+## Pass 3 (2026-05-07, MetaLoop cycle #340)
+
+### Scope decision
+
+The MetaLoop dispatched this pass with a stale framing — *"complete 30+
+missing test cases."* Eddie-Nirmana review rejected the framing per the
+Pass 1 principle (*"4 high-value tests rather than 30+ shallow ones"*)
+and refined the scope to: the highest-impact remaining gaps that do **not**
+require trait rework. Padding the count to 30 was explicitly out of scope.
+
+### Closed gaps
+
+- [x] **§3 supervisor — `KernelRequestHandler` target-side routing.**
+  Previously, `handle_loop_trigger` only verified the *source* process
+  was Running; the target was passed through without validation, so a
+  trigger targeting a stopped, restarting, or unregistered process
+  would silently return `status: routed` and the caller had no
+  signal that no listener existed. Implemented a target-side check
+  in `src/supervisor/handler.rs`: if `trigger.target != ProcessId::Kernel`,
+  the target must be in `active_processes` with state `Running`,
+  otherwise reject with `ERROR_PERMISSION_DENIED`. Kernel is exempted
+  because the handler *is* the kernel — applying the check would
+  reject every Loop-0/Loop-1/Loop-2 → Kernel trigger including the
+  meta-cycle path. Three new tests in
+  `tests/../src/supervisor/handler.rs` (cfg(test) module):
+  - `test_loop_trigger_to_stopped_target_rejected` — target registered but in `Starting` state → reject
+  - `test_loop_trigger_to_unregistered_target_rejected` — target absent from supervisor → reject
+  - `test_loop_trigger_to_running_target_routes` — both Running → routes successfully
+  - `test_loop_trigger_kernel_target_skips_target_running_check` —
+    regression guard: future refactors must not apply target-running
+    check to Kernel.
+  Implementation diff: ~17 LOC added to `handle_loop_trigger`. Within
+  Nirmana's 30-LOC bound for GREEN-authority change.
+
+- [x] **`envelope` — round-trip and validation invariants across the
+  full `SecurityZone × Priority × ResourceBudget` matrix.** The
+  existing `task_envelope.rs` inline tests covered single instances;
+  this pass adds *parametrized* coverage across 9 zone × priority
+  combinations and 4 budget shapes (min-nonzero, default, high-threshold,
+  low-threshold), so a regression on any one combination cannot
+  hide behind the others. New file `tests/envelope_property_tests.rs`
+  with 5 tests:
+  - `envelope_round_trip_all_zone_priority_combinations` — all 9
+    zone×priority pairs serialize→deserialize losslessly with all
+    fields preserved (env_vars, tool_endpoints, checkpoint_policy)
+  - `envelope_round_trip_zone_priority_budget_matrix` — 9 × 4 = 36
+    combinations round-trip and uphold token-budget invariants
+    (`exceeded` is strict `>`, `warning` triggers at `floor(max × threshold)`)
+  - `envelope_validation_rejects_zero_budget_fields_across_matrix` —
+    each zero-field rejection (`max_tokens=0`, `max_rss_mb=0`,
+    `max_wall_time=0`, threshold out-of-range) holds for every
+    zone × priority pair, guarding against accidental priority-class
+    bypass logic
+  - `priority_total_order_and_serialized_form_are_stable` — `Ord`
+    invariant + JSON shape (`"P0Critical"`/`"P1Normal"`/`"P2Background"`)
+    pinned, so log/telemetry joins on the string form don't silently break
+  - `security_zone_serialized_form_is_stable` — same guarantee for
+    `"Green"`/`"Yellow"`/`"Red"`
+
+### Still deferred
+
+- §1 (Pass 1) — dispatch server-side shutdown with a connected client:
+  still requires changing `RpcServer::serve()` to take a shutdown token
+  or return a handle. **YELLOW** — defer until the API change is
+  motivated by an actual call site, not by test coverage alone.
+- §4 — store WAL checkpoint failure: still requires injecting a
+  faulty backend via a trait rework. **YELLOW**.
+- §6 — envelope version negotiation: still a v1-only protocol.
+
+### What was deliberately NOT added
+
+- No padding tests to hit a "30+" count. Per Eddie's principle
+  (*"stability > intelligence, simplicity > complexity"*), shallow
+  tests dilute the signal of a green suite — every test added in
+  this pass exercises a production-impact path or a regression
+  guard for a behavior that telemetry/policy systems join on.
+- No git tag, no Cargo.toml version bump, no GitHub release. Tagging
+  is a one-way door touching public release timing — that decision
+  is **YELLOW** authority and stays with Eddie.
+
+### Pass 3 test count
+
+**+9 tests** (4 supervisor handler routing + 5 envelope property tests).
+All passing on `cargo test --release` — 305 tests total
+(296 from Pass 2 baseline + 9). Library inline tests: 171 (was 167).

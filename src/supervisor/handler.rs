@@ -284,6 +284,22 @@ impl KernelRequestHandler {
             ));
         }
 
+        // Verify target process is registered and running.
+        // Kernel is always available (it's this handler's host process), so skip the check.
+        if trigger.target != ProcessId::Kernel {
+            let target_running = health
+                .active_processes
+                .iter()
+                .any(|p| p.id == trigger.target
+                    && p.state == crate::supervisor::process::ProcessState::Running);
+            if !target_running {
+                return Err((
+                    ERROR_PERMISSION_DENIED,
+                    format!("target process {:?} is not running", trigger.target),
+                ));
+            }
+        }
+
         match &trigger.kind {
             TriggerKind::MetaCycleRequest { trigger_source } => {
                 tracing::info!(trigger_source, "meta cycle requested");
@@ -694,6 +710,128 @@ mod tests {
         assert_eq!(String::from_utf8(drift).unwrap(), "0.05");
 
         assert!(store.get("sie/policy/head").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_loop_trigger_to_stopped_target_rejected() {
+        // Source is Running, but target process exists yet is not Running → reject.
+        let supervisor = Arc::new(KernelSupervisor::new());
+        supervisor
+            .register(ProcessId::Loop2Harness, RestartPolicy::default())
+            .await;
+        supervisor
+            .update_state(ProcessId::Loop2Harness, crate::supervisor::process::ProcessState::Running)
+            .await
+            .unwrap();
+        supervisor
+            .register(ProcessId::Loop1Agentic, RestartPolicy::default())
+            .await;
+        // Loop1Agentic stays in Starting (not Running)
+
+        let governor = Arc::new(ResourceGovernor::new(GovernorConfig::default()));
+        let registry = Arc::new(TaskRegistry::new());
+        let store = Box::new(SqliteStateStore::open(":memory:").unwrap());
+        let handler = KernelRequestHandler::new(supervisor, governor, registry, store);
+
+        let trigger = LoopTrigger::new(
+            1,
+            ProcessId::Loop2Harness,
+            ProcessId::Loop1Agentic,
+            TriggerKind::Ping,
+        );
+        let params = serde_json::to_value(trigger).unwrap();
+        let result = handler.handle(RpcMethod::LoopTrigger, Some(params)).await;
+        assert!(result.is_err(), "expected rejection for stopped target");
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERROR_PERMISSION_DENIED);
+        assert!(
+            msg.contains("target process"),
+            "expected target-side error message, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_loop_trigger_to_unregistered_target_rejected() {
+        // Target ProcessId is not registered with the supervisor at all.
+        let supervisor = Arc::new(KernelSupervisor::new());
+        supervisor
+            .register(ProcessId::Loop2Harness, RestartPolicy::default())
+            .await;
+        supervisor
+            .update_state(ProcessId::Loop2Harness, crate::supervisor::process::ProcessState::Running)
+            .await
+            .unwrap();
+        // Loop1Agentic intentionally NOT registered
+
+        let governor = Arc::new(ResourceGovernor::new(GovernorConfig::default()));
+        let registry = Arc::new(TaskRegistry::new());
+        let store = Box::new(SqliteStateStore::open(":memory:").unwrap());
+        let handler = KernelRequestHandler::new(supervisor, governor, registry, store);
+
+        let trigger = LoopTrigger::new(
+            1,
+            ProcessId::Loop2Harness,
+            ProcessId::Loop1Agentic,
+            TriggerKind::Ping,
+        );
+        let params = serde_json::to_value(trigger).unwrap();
+        let result = handler.handle(RpcMethod::LoopTrigger, Some(params)).await;
+        assert!(result.is_err(), "expected rejection for unregistered target");
+        let (code, _) = result.unwrap_err();
+        assert_eq!(code, ERROR_PERMISSION_DENIED);
+    }
+
+    #[tokio::test]
+    async fn test_loop_trigger_to_running_target_routes() {
+        // Both source and target Running → trigger should route successfully.
+        let handler = make_handler().await;
+
+        let trigger = LoopTrigger::new(
+            42,
+            ProcessId::Loop2Harness,
+            ProcessId::Loop1Agentic,
+            TriggerKind::Ping,
+        );
+        let params = serde_json::to_value(trigger).unwrap();
+        let result = handler.handle(RpcMethod::LoopTrigger, Some(params)).await;
+        assert!(result.is_ok(), "expected successful routing, got: {result:?}");
+        let val = result.unwrap();
+        assert_eq!(val["status"], "routed");
+        assert_eq!(val["seq"], 42);
+    }
+
+    #[tokio::test]
+    async fn test_loop_trigger_kernel_target_skips_target_running_check() {
+        // Target=Kernel must always route, regardless of whether Kernel is in active_processes,
+        // because the handler IS the kernel. This guards against future refactors that might
+        // accidentally apply the target-running check to Kernel.
+        let supervisor = Arc::new(KernelSupervisor::new());
+        supervisor
+            .register(ProcessId::Loop0Meta, RestartPolicy::default())
+            .await;
+        supervisor
+            .update_state(ProcessId::Loop0Meta, crate::supervisor::process::ProcessState::Running)
+            .await
+            .unwrap();
+        // Kernel intentionally NOT registered with the supervisor
+
+        let governor = Arc::new(ResourceGovernor::new(GovernorConfig::default()));
+        let registry = Arc::new(TaskRegistry::new());
+        let store = Box::new(SqliteStateStore::open(":memory:").unwrap());
+        let handler = KernelRequestHandler::new(supervisor, governor, registry, store);
+
+        let trigger = LoopTrigger::new(
+            1,
+            ProcessId::Loop0Meta,
+            ProcessId::Kernel,
+            TriggerKind::MetaCycleRequest {
+                trigger_source: "test".into(),
+            },
+        );
+        let params = serde_json::to_value(trigger).unwrap();
+        let result = handler.handle(RpcMethod::LoopTrigger, Some(params)).await;
+        assert!(result.is_ok(), "Kernel target should bypass target-running check");
+        assert_eq!(result.unwrap()["status"], "authorized");
     }
 
     #[tokio::test]
