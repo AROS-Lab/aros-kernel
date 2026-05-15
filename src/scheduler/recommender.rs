@@ -1,5 +1,6 @@
 use crate::hardware::probe::SystemResources;
 use crate::hardware::pressure::MemoryPressureLevel;
+use crate::hardware::thermal::ThermalPressureLevel;
 
 pub struct Recommender {
     ram_headroom_base_mb: u32,
@@ -55,6 +56,39 @@ impl Recommender {
         } else {
             recommended
         }
+    }
+
+    /// Thermal de-rating multiplier applied on top of the RAM/CPU recommendation.
+    ///
+    /// Unlike memory pressure (where Critical is a hard stop in the admission
+    /// controller), thermal throttling degrades gracefully: the hotter the
+    /// package, the fewer agents we run so the machine can shed heat.
+    /// Nominal = 1x, Fair = 0.75x, Serious = 0.5x, Critical = 0.25x.
+    fn thermal_multiplier(thermal: ThermalPressureLevel) -> f64 {
+        match thermal {
+            ThermalPressureLevel::Nominal => 1.0,
+            ThermalPressureLevel::Fair => 0.75,
+            ThermalPressureLevel::Serious => 0.5,
+            ThermalPressureLevel::Critical => 0.25,
+        }
+    }
+
+    /// Recommend max agents, additionally clamped by thermal pressure.
+    ///
+    /// This composes on top of `recommend_max_agents`: it first computes the
+    /// RAM/CPU/hard-limit recommendation, then applies the thermal de-rating
+    /// multiplier. Thermal pressure can only ever *lower* the recommendation,
+    /// never raise it.
+    pub fn recommend_max_agents_thermal(
+        &self,
+        resources: &SystemResources,
+        pressure: MemoryPressureLevel,
+        thermal: ThermalPressureLevel,
+        ram_per_agent_mb: u32,
+    ) -> u32 {
+        let base = self.recommend_max_agents(resources, pressure, ram_per_agent_mb);
+        let clamped = (base as f64 * Self::thermal_multiplier(thermal)) as u32;
+        clamped.min(base)
     }
 
     /// Generate a formatted capacity summary for the given hardware state.
@@ -171,6 +205,93 @@ mod tests {
         let max = r.recommend_max_agents(&res, MemoryPressureLevel::Normal, 250);
         // Without limit would be 20, but hard limit is 3
         assert_eq!(max, 3);
+    }
+
+    #[test]
+    fn test_thermal_clamp_nominal_is_noop() {
+        let r = Recommender::with_defaults();
+        let res = make_resources(10, 16384, 12000);
+        let base = r.recommend_max_agents(&res, MemoryPressureLevel::Normal, 250);
+        let thermal = r.recommend_max_agents_thermal(
+            &res,
+            MemoryPressureLevel::Normal,
+            ThermalPressureLevel::Nominal,
+            250,
+        );
+        // Nominal thermal must not change the recommendation.
+        assert_eq!(base, thermal);
+    }
+
+    #[test]
+    fn test_thermal_clamp_reduces_with_heat() {
+        let r = Recommender::with_defaults();
+        let res = make_resources(10, 16384, 12000);
+        // base = 20 (CPU-limited)
+        let nominal = r.recommend_max_agents_thermal(
+            &res, MemoryPressureLevel::Normal, ThermalPressureLevel::Nominal, 250,
+        );
+        let fair = r.recommend_max_agents_thermal(
+            &res, MemoryPressureLevel::Normal, ThermalPressureLevel::Fair, 250,
+        );
+        let serious = r.recommend_max_agents_thermal(
+            &res, MemoryPressureLevel::Normal, ThermalPressureLevel::Serious, 250,
+        );
+        let critical = r.recommend_max_agents_thermal(
+            &res, MemoryPressureLevel::Normal, ThermalPressureLevel::Critical, 250,
+        );
+        // 20 → 20, 15, 10, 5 — monotonically non-increasing with heat.
+        assert_eq!(nominal, 20);
+        assert_eq!(fair, 15);
+        assert_eq!(serious, 10);
+        assert_eq!(critical, 5);
+        assert!(critical < serious && serious < fair && fair <= nominal);
+    }
+
+    #[test]
+    fn test_thermal_clamp_never_exceeds_base() {
+        let r = Recommender::with_defaults();
+        let res = make_resources(10, 16384, 12000);
+        let base = r.recommend_max_agents(&res, MemoryPressureLevel::Normal, 250);
+        // Every thermal level must stay <= the un-clamped base.
+        for thermal in [
+            ThermalPressureLevel::Nominal,
+            ThermalPressureLevel::Fair,
+            ThermalPressureLevel::Serious,
+            ThermalPressureLevel::Critical,
+        ] {
+            let clamped = r.recommend_max_agents_thermal(
+                &res, MemoryPressureLevel::Normal, thermal, 250,
+            );
+            assert!(clamped <= base, "thermal {:?} raised the recommendation", thermal);
+        }
+    }
+
+    #[test]
+    fn test_thermal_clamp_composes_with_memory_pressure() {
+        let r = Recommender::with_defaults();
+        let res = make_resources(10, 16384, 8000);
+        // Critical memory pressure already lowers base to 11 (see
+        // test_recommend_critical_pressure); Serious thermal halves that.
+        let critical_mem = r.recommend_max_agents_thermal(
+            &res,
+            MemoryPressureLevel::Critical,
+            ThermalPressureLevel::Serious,
+            250,
+        );
+        assert_eq!(critical_mem, 5); // floor(11 * 0.5)
+    }
+
+    #[test]
+    fn test_thermal_clamp_zero_base_stays_zero() {
+        let r = Recommender::with_defaults();
+        // No RAM headroom → base 0; thermal clamp must not panic or wrap.
+        let res = make_resources(10, 4096, 2048);
+        let base = r.recommend_max_agents(&res, MemoryPressureLevel::Normal, 250);
+        assert_eq!(base, 0);
+        let clamped = r.recommend_max_agents_thermal(
+            &res, MemoryPressureLevel::Normal, ThermalPressureLevel::Critical, 250,
+        );
+        assert_eq!(clamped, 0);
     }
 
     #[test]

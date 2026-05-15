@@ -1,5 +1,6 @@
 use aros_kernel::hardware::probe::probe_system;
 use aros_kernel::hardware::pressure::detect_pressure;
+use aros_kernel::hardware::thermal::{detect_thermal, ThermalPressureLevel};
 use aros_kernel::scheduler::admission::{
     AdmissionController, MemoryPressureLevel, ResourceRequirements,
 };
@@ -224,6 +225,79 @@ fn test_full_scheduling_flow() {
     assert!(
         recommended <= (resources.cpu_count as u32) * 2,
         "Recommended ({}) should be bounded by CPU limit",
+        recommended
+    );
+}
+
+#[test]
+fn test_recommender_thermal_clamp_real_hardware() {
+    // End-to-end: probe → detect thermal → thermally-clamped recommendation.
+    let resources = probe_system();
+    let recommender = Recommender::with_defaults();
+    let thermal = detect_thermal(&resources);
+
+    let base = recommender.recommend_max_agents(&resources, MemoryPressureLevel::Normal, 250);
+    let clamped = recommender.recommend_max_agents_thermal(
+        &resources,
+        MemoryPressureLevel::Normal,
+        thermal.level,
+        250,
+    );
+
+    // The thermal clamp can only ever lower the recommendation.
+    assert!(
+        clamped <= base,
+        "Thermally-clamped recommendation ({}) must not exceed base ({})",
+        clamped,
+        base
+    );
+
+    // Hotter levels must never produce more agents than cooler ones.
+    let nominal = recommender.recommend_max_agents_thermal(
+        &resources, MemoryPressureLevel::Normal, ThermalPressureLevel::Nominal, 250,
+    );
+    let critical = recommender.recommend_max_agents_thermal(
+        &resources, MemoryPressureLevel::Normal, ThermalPressureLevel::Critical, 250,
+    );
+    assert!(
+        critical <= nominal,
+        "Critical thermal ({}) must not exceed Nominal thermal ({})",
+        critical,
+        nominal
+    );
+}
+
+#[test]
+fn test_full_scheduling_flow_with_thermal() {
+    // Extends the probe→pressure→admission flow with the thermal dimension.
+    let resources = probe_system();
+    let pressure = detect_pressure(&resources);
+    let thermal = detect_thermal(&resources);
+
+    let sched_pressure = match pressure.level {
+        aros_kernel::hardware::pressure::MemoryPressureLevel::Normal => {
+            MemoryPressureLevel::Normal
+        }
+        aros_kernel::hardware::pressure::MemoryPressureLevel::Warn => {
+            MemoryPressureLevel::Warn
+        }
+        aros_kernel::hardware::pressure::MemoryPressureLevel::Critical => {
+            MemoryPressureLevel::Critical
+        }
+    };
+
+    let recommender = Recommender::with_defaults();
+    let recommended = recommender.recommend_max_agents_thermal(
+        &resources,
+        sched_pressure,
+        thermal.level,
+        250,
+    );
+
+    // Must stay bounded by the CPU limit no matter the thermal/pressure mix.
+    assert!(
+        recommended <= (resources.cpu_count as u32) * 2,
+        "Thermally-clamped recommendation ({}) should be bounded by CPU limit",
         recommended
     );
 }

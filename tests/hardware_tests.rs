@@ -1,6 +1,7 @@
 use aros_kernel::hardware::pressure::{detect_from_ratio, detect_pressure, MemoryPressureLevel};
 use aros_kernel::hardware::probe::probe_system;
 use aros_kernel::hardware::snapshot::take_snapshot;
+use aros_kernel::hardware::thermal::{detect_thermal, ThermalPressureLevel};
 
 #[test]
 fn test_real_probe_returns_valid_values() {
@@ -141,4 +142,37 @@ fn test_pressure_level_ordering() {
     // Boundary: exactly 85% used -> Critical
     let boundary_critical = detect_from_ratio(10000, 1500);
     assert_eq!(boundary_critical.level, MemoryPressureLevel::Critical);
+}
+
+#[test]
+fn test_thermal_detection_real() {
+    // detect_thermal must work on real hardware regardless of platform:
+    // valid variant, recognized non-empty source.
+    let resources = probe_system();
+    let result = detect_thermal(&resources);
+
+    match result.level {
+        ThermalPressureLevel::Nominal
+        | ThermalPressureLevel::Fair
+        | ThermalPressureLevel::Serious
+        | ThermalPressureLevel::Critical => {}
+    }
+
+    assert!(!result.source.is_empty(), "Thermal source must be non-empty");
+    assert!(
+        ["xcpm_thermal_level", "load_ratio", "unavailable"]
+            .contains(&result.source.as_str()),
+        "Thermal source '{}' should be a recognized probe path",
+        result.source
+    );
+}
+
+#[test]
+fn test_thermal_detection_stable_under_cache() {
+    // probe_system is 2s-cached, so back-to-back thermal reads off the same
+    // cached resources should agree (no flapping within the cache window).
+    let first = detect_thermal(&probe_system());
+    let second = detect_thermal(&probe_system());
+    assert_eq!(first.level, second.level);
+    assert_eq!(first.source, second.source);
 }
