@@ -18,8 +18,9 @@ pub enum ThermalPressureLevel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThermalResult {
     pub level: ThermalPressureLevel,
-    /// Where the reading came from: `xcpm_thermal_level`, `load_ratio`,
-    /// or `unavailable` (fail-safe — treated as Nominal, no throttling).
+    /// Where the reading came from: `xcpm_thermal_level` (macOS),
+    /// `sys_thermal_zone` (Linux), `load_ratio` (portable proxy), or
+    /// `unavailable` (fail-safe — treated as Nominal, no throttling).
     pub source: String,
 }
 
@@ -47,6 +48,30 @@ mod sysctl {
     }
 }
 
+// ── Linux thermal-zone helper ───────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+mod thermal_zone {
+    use std::fs;
+
+    /// Read every `/sys/class/thermal/thermal_zone*/temp` and return the
+    /// hottest zone temperature in °C, or `None` if the directory is
+    /// absent or no zone yields a valid reading.
+    pub fn max_celsius() -> Option<f64> {
+        let entries = fs::read_dir("/sys/class/thermal").ok()?;
+        let readings = entries.filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?;
+            if !name.starts_with("thermal_zone") {
+                return None;
+            }
+            // A missing/unreadable temp file simply drops that zone.
+            fs::read_to_string(path.join("temp")).ok()
+        });
+        super::max_zone_celsius(readings)
+    }
+}
+
 // ── Detection logic ─────────────────────────────────────────────────
 
 /// Classify a raw macOS `machdep.xcpm.cpu_thermal_level` reading.
@@ -60,6 +85,55 @@ fn classify_xcpm_level(raw: i32) -> ThermalPressureLevel {
         31..=60 => ThermalPressureLevel::Serious,
         _ => ThermalPressureLevel::Critical,
     }
+}
+
+/// Classify an absolute CPU/SoC temperature (°C) into a pressure level.
+///
+/// Unlike the relative xcpm index, Linux thermal zones report an absolute
+/// temperature, so we band it directly. Cutoffs are heuristic — chosen to
+/// mirror the xcpm bands and tunable as field data arrives: `< 60` is
+/// comfortable, `>= 95` is at the throttle ceiling of typical x86/ARM
+/// packages.
+#[cfg(any(target_os = "linux", test))]
+fn classify_celsius(celsius: f64) -> ThermalPressureLevel {
+    if celsius < 60.0 {
+        ThermalPressureLevel::Nominal
+    } else if celsius < 80.0 {
+        ThermalPressureLevel::Fair
+    } else if celsius < 95.0 {
+        ThermalPressureLevel::Serious
+    } else {
+        ThermalPressureLevel::Critical
+    }
+}
+
+/// Parse a single `/sys/class/thermal/thermal_zone*/temp` reading.
+///
+/// The sysfs file holds the zone temperature in millidegrees Celsius as
+/// ASCII (e.g. `"52000\n"` == 52.0 °C). Returns `None` for empty or
+/// non-numeric contents so a flaky zone never poisons the reading.
+#[cfg(any(target_os = "linux", test))]
+fn parse_zone_millidegrees(raw: &str) -> Option<f64> {
+    let milli: i64 = raw.trim().parse().ok()?;
+    Some(milli as f64 / 1000.0)
+}
+
+/// Reduce a set of raw sysfs `temp` contents to the hottest zone, in °C.
+///
+/// A box exposes several zones (CPU, GPU, battery, …); the hottest is the
+/// one that bounds throttling, so we take the max. Unreadable or
+/// non-numeric zones are skipped; if no zone yields a valid reading the
+/// result is `None` so the caller falls back to the load-ratio proxy.
+#[cfg(any(target_os = "linux", test))]
+fn max_zone_celsius<I, S>(zones: I) -> Option<f64>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    zones
+        .into_iter()
+        .filter_map(|raw| parse_zone_millidegrees(raw.as_ref()))
+        .fold(None, |acc, c| Some(acc.map_or(c, |m: f64| m.max(c))))
 }
 
 /// Portable thermal proxy: the 1-minute load average relative to core count.
@@ -95,11 +169,17 @@ pub fn detect_from_load_ratio(resources: &SystemResources) -> ThermalResult {
 
 /// Detect thermal pressure from system resources.
 ///
-/// On macOS this prefers the kernel's `machdep.xcpm.cpu_thermal_level`
-/// signal and falls back to the portable load-ratio proxy when that
-/// sysctl is unavailable (e.g. on Apple Silicon). On other platforms it
-/// uses the load-ratio proxy directly. Linux thermal-zone and GPU/power
-/// telemetry are intentionally out of scope for this pass.
+/// Each platform prefers its most direct sensor and falls back to the
+/// portable load-ratio proxy when that sensor is unavailable:
+/// - **macOS**: the kernel's `machdep.xcpm.cpu_thermal_level` sysctl
+///   (absent on some Apple Silicon → proxy).
+/// - **Linux**: the hottest `/sys/class/thermal/thermal_zone*/temp` zone
+///   (absent in some containers/VMs → proxy).
+/// - **Other**: the load-ratio proxy directly.
+///
+/// All paths fail safe: any missing/unreadable sensor degrades to the
+/// proxy rather than throttling blindly. GPU/power telemetry remains out
+/// of scope for this pass.
 #[cfg(target_os = "macos")]
 pub fn detect_thermal(resources: &SystemResources) -> ThermalResult {
     if let Some(raw) = unsafe { sysctl::sysctl_i32("machdep.xcpm.cpu_thermal_level") } {
@@ -112,7 +192,19 @@ pub fn detect_thermal(resources: &SystemResources) -> ThermalResult {
     detect_from_load_ratio(resources)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+pub fn detect_thermal(resources: &SystemResources) -> ThermalResult {
+    if let Some(celsius) = thermal_zone::max_celsius() {
+        return ThermalResult {
+            level: classify_celsius(celsius),
+            source: "sys_thermal_zone".into(),
+        };
+    }
+    // No readable thermal zone — fall back to the portable proxy.
+    detect_from_load_ratio(resources)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn detect_thermal(resources: &SystemResources) -> ThermalResult {
     detect_from_load_ratio(resources)
 }
@@ -215,11 +307,62 @@ mod tests {
             | ThermalPressureLevel::Critical => {}
         }
         assert!(
-            ["xcpm_thermal_level", "load_ratio", "unavailable"]
+            ["xcpm_thermal_level", "sys_thermal_zone", "load_ratio", "unavailable"]
                 .contains(&result.source.as_str()),
             "unexpected thermal source: {}",
             result.source
         );
+    }
+
+    #[test]
+    fn test_classify_celsius() {
+        // Below 60 °C is comfortable.
+        assert_eq!(classify_celsius(20.0), ThermalPressureLevel::Nominal);
+        assert_eq!(classify_celsius(59.9), ThermalPressureLevel::Nominal);
+        // 60..80 → Fair (boundary is inclusive lower).
+        assert_eq!(classify_celsius(60.0), ThermalPressureLevel::Fair);
+        assert_eq!(classify_celsius(79.9), ThermalPressureLevel::Fair);
+        // 80..95 → Serious.
+        assert_eq!(classify_celsius(80.0), ThermalPressureLevel::Serious);
+        assert_eq!(classify_celsius(94.9), ThermalPressureLevel::Serious);
+        // >= 95 → Critical.
+        assert_eq!(classify_celsius(95.0), ThermalPressureLevel::Critical);
+        assert_eq!(classify_celsius(110.0), ThermalPressureLevel::Critical);
+    }
+
+    #[test]
+    fn test_parse_zone_millidegrees() {
+        // Millidegrees with trailing newline, as sysfs emits it.
+        assert_eq!(parse_zone_millidegrees("52000\n"), Some(52.0));
+        assert_eq!(parse_zone_millidegrees("  48500 "), Some(48.5));
+        assert_eq!(parse_zone_millidegrees("0"), Some(0.0));
+        // Junk / empty zones are dropped, not panicked on.
+        assert_eq!(parse_zone_millidegrees(""), None);
+        assert_eq!(parse_zone_millidegrees("N/A"), None);
+        assert_eq!(parse_zone_millidegrees("52.0"), None);
+    }
+
+    #[test]
+    fn test_max_zone_celsius_picks_hottest() {
+        // Several zones → hottest wins (GPU at 71 °C here).
+        let zones = vec!["45000\n", "71000\n", "60000\n"];
+        assert_eq!(max_zone_celsius(zones), Some(71.0));
+    }
+
+    #[test]
+    fn test_max_zone_celsius_skips_unreadable() {
+        // Non-numeric zones are skipped; the lone valid reading wins.
+        let zones = vec!["error", "", "63000\n", "garbage"];
+        assert_eq!(max_zone_celsius(zones), Some(63.0));
+    }
+
+    #[test]
+    fn test_max_zone_celsius_none_when_empty() {
+        // No zones at all → None so the caller falls back to the proxy.
+        let empty: Vec<&str> = vec![];
+        assert_eq!(max_zone_celsius(empty), None);
+        // All-invalid zones also yield None.
+        assert_eq!(max_zone_celsius(vec!["x", "y"]), None);
     }
 
     #[test]
